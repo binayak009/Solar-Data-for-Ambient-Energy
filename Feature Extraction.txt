@@ -1,0 +1,39 @@
+
+# ======================================================
+# Part-II Feature
+# ======================================================
+def add_cyclic_features(df):
+    df = df.copy()
+    df['hour'], df['minute'] = df.index.hour, df.index.minute
+    df['dayofweek'], df['month'] = df.index.dayofweek, df.index.month
+    for c, M in [('hour', 24), ('minute', 60), ('dayofweek', 7)]:
+        df[f'{c}_sin'] = np.sin(2 * np.pi * df[c] / M)
+        df[f'{c}_cos'] = np.cos(2 * np.pi * df[c] / M)
+    df['month_sin'] = np.sin(2 * np.pi * (df['month'] - 1) / 12)
+    df['month_cos'] = np.cos(2 * np.pi * (df['month'] - 1) / 12)
+    return df
+
+def decompose_train(s, period=144):
+    da = seasonal_decompose(s, model='additive', period=period)
+    dm = seasonal_decompose(s + 1e-3, model='multiplicative', period=period)
+    out = pd.DataFrame({'trend_add': da.trend, 'seasonal_add': da.seasonal,
+                        'resid_add': da.resid, 'trend_mul': dm.trend,
+                        'seasonal_mul': dm.seasonal, 'resid_mul': dm.resid},
+                       index=s.index)
+    return out.bfill().ffill()
+
+def apply_decomp_to_split(df, td, period=144):
+    n = len(df)
+    r = pd.DataFrame(index=df.index)
+    r['trend_add'] = float(td['trend_add'].iloc[-1])
+    r['trend_mul'] = float(td['trend_mul'].iloc[-1])
+    r['seasonal_add'] = np.tile(td['seasonal_add'].values[-period:], int(np.ceil(n / period)))[:n]
+    r['seasonal_mul'] = np.tile(td['seasonal_mul'].values[-period:], int(np.ceil(n / period)))[:n]
+    r['resid_add'] = df['Power_MW'].values - r['trend_add'].values - r['seasonal_add'].values
+    r['resid_mul'] = df['Power_MW'].values / (r['trend_mul'].values * r['seasonal_mul'].values + 1e-8)
+    return r
+
+CYCLIC_COLS = ['hour_sin', 'hour_cos', 'minute_sin', 'minute_cos',
+               'dayofweek_sin', 'dayofweek_cos', 'month_sin', 'month_cos']
+DECOMP_COLS = ['trend_add', 'seasonal_add', 'resid_add',
+               'trend_mul', 'seasonal_mul', 'resid_mul']

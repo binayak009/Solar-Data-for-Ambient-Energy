@@ -1,0 +1,106 @@
+# ======================================================
+# RF + IBCO-optimised BiLSTM residual corrector
+# VERSION 7 - Proposed Improved Bitterling Colony Optimization (IBCO)
+#
+# Implements the paper's IBCO (Eqs. 9-51):
+#   - Mussel position Bn = Xbest + H*c*Tempg      (Eqs. 9-16)
+#   - Dynamic step L                               (Eq. 17)
+#   - Sine-Cosine guided travel behaviour (TB)     (Eqs. 18-28)
+#   - DPCM eviction behaviour (EB)                 (Eqs. 29-31)
+#   - Reproductive behaviour (RB) male / female    (Eqs. 26, 32)
+#   - Adaptive dispersal probability               (Eq. 33)
+#   - MSE fitness                                  (Eqs. 34-35)
+#   - Greedy acceptance                            (Eq. 36)
+#   - Colony transition probabilities              (Eqs. 37-40)
+#   - Diversity measure + scattering strategy      (Eqs. 41-45)
+#   - Exploration/exploitation ratios              (Eqs. 46-48)
+#   - Convergence criterion                        (Eq. 49)
+#
+# Total tuned parameters = 14 (RF) + 9 (BiLSTM) = 23  (as in the abstract)
+# Other paper alignments:
+#   - split: 75% train (10% of it = validation) / 25% test
+#   - residual + derivative min-max normalised to [0, 1]
+#   - both tuners use validation MSE as fitness
+#   - extra metrics: MASE, PICP, PINAW, AWD, ACE
+# ======================================================
+
+
+
+
+# ======================================================
+# Part-III Improved Bitterling Colony Optimization (IBCO)
+# ======================================================
+class IBCO:
+    """
+    Generic IBCO minimiser.
+    fitness_fn(position) -> (fitness: float, aux: any)   aux = e.g. trained model
+    """
+    def __init__(self, fitness_fn, low, up, pop_size=30, max_iter=200,
+                 a=2.0, r1_min=0.05,          # SCA coefficients (Eq. 18)
+                 p_dis_min=0.2, p_dis_max=0.9,  # Eq. 33
+                 p_evict=0.2,                 # prob. of EB inside the dispersal branch
+                 net=10,                      # DPCM grid cells per dimension (Eq. 29)
+                 theta=0.05,                  # diversity threshold (Eq. 44)
+                 scatter_frac=0.30,           # worst fraction re-scattered
+                 conv_p=20, conv_eps=1e-4,    # Eq. 49
+                 eval_female=False, name="IBCO", checkpoint=None):
+        self.f, self.low, self.up = fitness_fn, np.asarray(low, float), np.asarray(up, float)
+        self.dim, self.n, self.T = len(low), pop_size, max_iter
+        self.a, self.r1_min = a, r1_min
+        self.pmin, self.pmax, self.p_evict = p_dis_min, p_dis_max, p_evict
+        self.net, self.theta, self.scatter_frac = net, theta, scatter_frac
+        self.conv_p, self.conv_eps = conv_p, conv_eps
+        self.eval_female, self.name, self.checkpoint = eval_female, name, checkpoint
+        self.best_x, self.best_f, self.best_aux = None, np.inf, None
+        self.history, self.div_history = [], []
+
+    # ---- helpers --------------------------------------------------
+    def _clip(self, x):
+        return np.clip(x, self.low, self.up)
+
+    def _diversity(self, pop):                              # Eqs. 41-43
+        xm = pop.mean(axis=0)
+        div = np.mean(np.linalg.norm(pop - xm, axis=1))
+        return div / np.linalg.norm(self.up - self.low)
+
+    def _mussel(self, it):                                  # Eqs. 9-16
+        H = 2 * ((self.T - it + 1) / self.T) ** 2 * np.sin(2 * np.pi * np.random.rand())   # Eq. 10
+        k = int(np.ceil(np.random.rand() * self.dim)) if it < 0.25 * self.T else 1       # Eq. 13
+        k = max(1, min(k, self.dim))
+        g = np.random.permutation(self.dim)[:k]             # Eq. 12
+        c = np.zeros(self.dim); c[g] = 1.0                  # Eq. 11
+        temp = np.round(0.5 * (0.5 + np.random.rand(self.dim)))    # Eqs. 15-16
+        tempg = (1 - temp) * np.abs(self.up - self.best_x) + temp * np.abs(self.low - self.best_x)  # Eq. 14
+        return self._clip(self.best_x + H * c * tempg)      # Eq. 9
+
+    def _step_L(self, it):                                  # Eq. 17
+        return 2 * ((self.T - it + 1) / self.T) ** 0.5 * np.sin(2 * np.pi * np.random.rand())
+
+    def _sca_travel(self, x, it):                           # Eqs. 18-25
+        r1 = max(self.a - self.a * it / self.T, self.r1_min)
+        r2 = np.random.uniform(0, 2 * np.pi)
+        r3 = np.random.uniform(0, 2)
+        r4 = np.random.rand()
+        dest = np.abs(r3 * self.best_x - x)                 # Eq. 22
+        return x + r1 * (np.sin(r2) if r4 < 0.5 else np.cos(r2)) * dest
+
+    def _dpcm_evict(self, pop):                             # Eqs. 29-31
+        lnet = (self.up - self.low) / self.net
+        new = np.empty(self.dim)
+        for d in range(self.dim):
+            cell = np.clip(((pop[:, d] - self.low[d]) / max(lnet[d], 1e-12)).astype(int), 0, self.net - 1)
+            crowd = np.bincount(cell, minlength=self.net)
+            idx = int(np.argmin(crowd))                     # least crowded cell (Eq. 30)
+            new[d] = self.low[d] + (idx + np.random.rand()) * lnet[d]   # sampled inside that cell
+        return new
+
+    def _p_dis(self, it):                                   # Eq. 33
+        return self.pmin + (self.pmax - self.pmin) * (1 - it / self.T)
+
+    def _converged(self):                                   # Eq. 49
+        h, p = self.history, self.conv_p
+        if len(h) <= p:
+            return False
+        return abs(h[-1] - h[-1 - p]) / (abs(h[-1 - p]) + 1e-12) < self.conv_eps
+
+
